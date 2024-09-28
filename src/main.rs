@@ -1,10 +1,21 @@
 const VID_3DS: u16 = 0x16D0;
 const PID_3DS: u16 = 0x06A3;
 use std::time::Duration;
+use std::time::SystemTime;
 
-use rusb::{DeviceHandle, GlobalContext};
-const BULK_ENDPOINT_ADDRESS: u8 = 130;
+use rusb::{Device, DeviceHandle, GlobalContext};
+// Might be a better way to specify this
+// const BULK_ENDPOINT_ADDRESS: u8 = 130;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
+const VEND_OUT_REQ: u8 = 0x40;
+const VEND_OUT_VALUE: u16 = 0;
+const VEND_OUT_IDX: u16 = 0;
+
+// Could give more specific explanation here.
+// const FULL_BUFF_SIZE: usize = 522500;
+const FULL_BUFF_SIZE: usize = 523500;
+const VIDEO_BUFFER_SIZE: usize = 518400;
+// const EXTENDED_VID_BUFFER_SIZE: usize = 550000;
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -25,61 +36,84 @@ impl Endpoint {
     }
 }
 
-fn get_3ds_device() -> Option<rusb::Device<rusb::GlobalContext>> {
-    for device in rusb::devices().unwrap().iter() {
-        let device_desc = device.device_descriptor().unwrap();
+struct DS {
+    device: Device<GlobalContext>,
+    handle: DeviceHandle<GlobalContext>,
+}
 
-        if device_desc.vendor_id() == VID_3DS && device_desc.product_id() == PID_3DS {
-            return Some(device);
-        }
+impl DS {
+    pub fn new(device: Device<GlobalContext>, handle: DeviceHandle<GlobalContext>) -> Self {
+        Self { device, handle }
     }
-
-    None
 }
 
-// You probably need to combine these fns because they're connected.
-fn get_3ds_handle() -> Option<DeviceHandle<GlobalContext>> {
-    rusb::open_device_with_vid_pid(VID_3DS, PID_3DS)
+fn get_3ds_device_and_handle() -> Result<DS, anyhow::Error> {
+    // Not sure why I still need unwraps here.
+    let device = rusb::devices()
+        .unwrap()
+        .iter()
+        .find(|dvc| {
+            // Remove unwrpaps
+            let desc = dvc.device_descriptor().unwrap();
+            desc.vendor_id() == VID_3DS && desc.product_id() == PID_3DS
+        })
+        .ok_or(anyhow::Error::msg("unable to find 3ds device"))
+        .unwrap();
+
+    let handle = rusb::open_device_with_vid_pid(VID_3DS, PID_3DS)
+        .ok_or(anyhow::Error::msg("unable to retrieve device handle"))
+        .unwrap();
+
+    Ok(DS::new(device, handle))
 }
 
-// Need to add some debugging here - we expect only one endpoint but could be more right?
 fn get_endpoint(device: rusb::Device<rusb::GlobalContext>) -> Result<Endpoint, anyhow::Error> {
     let device_desc = device.device_descriptor().unwrap();
+    println!("Max supported USB Version: {}", device_desc.usb_version());
 
-    // Iterate over device configurations
-    for n in 0..device_desc.num_configurations() {
-        let config_desc = match device.config_descriptor(n) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(anyhow::Error::msg(
-                    "unable to retrieve device configuration",
-                ));
-            }
-        };
-
-        // Fix this loop never loops error.
-        for interface in config_desc.interfaces() {
-            for interface_desc in interface.descriptors() {
-                for endpoint_desc in interface_desc.endpoint_descriptors() {
-                    if endpoint_desc.address() != BULK_ENDPOINT_ADDRESS {
-                        // Interesting. Do we have to type return and semi in a for loop?
-                        return Err(anyhow::Error::msg("endpoint was not the bulk endpoint"));
-                    } else {
-                        return Ok(Endpoint::new(
-                            config_desc.number(),
-                            interface_desc.interface_number(),
-                            interface_desc.setting_number(),
-                            endpoint_desc.address(),
-                        ));
-                    }
-                }
-            }
+    // AFAIK there is only one bulk endpoint, but could be improved to check.
+    let config_desc = match device.config_descriptor(0) {
+        Ok(cd) => cd,
+        Err(e) => {
+            return Err(anyhow::Error::msg(format!(
+                "unable to get config descriptor: {}",
+                e
+            )))
         }
-    }
+    };
 
-    Err(anyhow::Error::msg("failed to find bulk endpoint"))
+    let interface = match config_desc.interfaces().last() {
+        Some(iface) => iface,
+        None => return Err(anyhow::Error::msg("unable to retrieve interface")),
+    };
+
+    let interface_desc = match interface.descriptors().last() {
+        Some(id) => id,
+        None => {
+            return Err(anyhow::Error::msg(
+                "unable to retrieve inferface description",
+            ))
+        }
+    };
+
+    let endpoint_desc = match interface_desc.endpoint_descriptors().last() {
+        Some(ed) => ed,
+        None => {
+            return Err(anyhow::Error::msg(
+                "unable to retrieve endpoint description",
+            ))
+        }
+    };
+
+    Ok(Endpoint::new(
+        config_desc.number(),
+        interface_desc.interface_number(),
+        interface_desc.setting_number(),
+        endpoint_desc.address(),
+    ))
 }
 
+// Might just be my screen but could be worth brightening this too.
 // this wont really be capture screen anymore
 fn capture_screen(
     handle: &DeviceHandle<GlobalContext>,
@@ -88,63 +122,53 @@ fn capture_screen(
     // sink: &mut rodio::Sink,
 ) {
     // Should be able to clean this up so we don't need to duplicate the buffer.
-    let max_buffer_size = 525000;
-    let buf = [0u8; 512];
-    let mut buffer = vec![0u8; max_buffer_size];
-    let req = rusb::request_type(
+    // let max_buffer_size = 525000;
+
+    let vend_out_buff = [0u8; 512];
+    let vend_out_req_type = rusb::request_type(
         rusb::Direction::Out,
         rusb::RequestType::Vendor,
         rusb::Recipient::Device,
     );
 
-    // Should also check max USB speed on device.
-    // 0x40 should be turned into a constant as part of docs.
-    match handle.write_control(req, 0x40, 0, 0, &buf, DEFAULT_TIMEOUT) {
-        Ok(res) => println!("Success was {:?}", res),
-        Err(err) => println!("Error was {:?}", err),
-    };
+    // Probably need to handle this because it could fail on any vend
+    handle
+        .write_control(
+            vend_out_req_type,
+            VEND_OUT_REQ,
+            VEND_OUT_VALUE,
+            VEND_OUT_IDX,
+            &vend_out_buff,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("unable to vend out to device");
 
-    let mut full_buff_size = 0;
+    let mut combined_buff = vec![0u8; FULL_BUFF_SIZE];
+
     loop {
-        match handle.read_bulk(endpoint.address, &mut buffer, DEFAULT_TIMEOUT) {
-            Ok(len) => {
-                if len == 0 {
+        match handle.read_bulk(endpoint.address, &mut combined_buff, DEFAULT_TIMEOUT) {
+            Ok(bytes_rec) => {
+                if bytes_rec == 0 {
                     break;
                 }
-                println!("Received {} bytes of data", len);
-                full_buff_size = len
             }
             Err(err) => {
-                println!("{:?}", err);
+                eprintln!("unable to read from bulk endpoint: {}", err);
                 break;
             }
-        };
-    }
-
-    let mut video_vec_u8: Vec<u8> = Vec::new();
-    let mut audio_vec_u8: Vec<u8> = Vec::new();
-
-    let mut i = 0;
-
-    // Everything after 518400 should be audio
-    let video_buff_len = 518400;
-
-    // Yeah this is gross.
-    while i < full_buff_size {
-        if i < video_buff_len {
-            video_vec_u8.push(buffer[i]);
-        } else {
-            audio_vec_u8.push(buffer[i])
         }
-        i += 1;
     }
-    println!("Video data length is {}", video_vec_u8.len());
-    println!("Audio data length is {}", audio_vec_u8.len());
+
+    // 50% framerate improvement!
+    let (vid_buff, _audio_buff) = combined_buff
+        .split_first_chunk::<VIDEO_BUFFER_SIZE>()
+        .expect("couldnt break buffers");
 
     let width = 240;
     let height = 720;
 
-    let vid_buf_32 = u8_to_u32(&video_vec_u8);
+    // Wonder if there's a way we can avoid the rotation. Or continue building the buffer without blocking the draw.
+    let vid_buf_32 = u8_to_u32(vid_buff);
     let rotated_vid_buf = rotate_270(&vid_buf_32, width, height);
     window
         .update_with_buffer(&rotated_vid_buf, height, width)
@@ -172,7 +196,6 @@ fn rotate_270(buffer: &[u32], width: usize, height: usize) -> Vec<u32> {
 // CHUNKING CODE
 fn u8_to_u32(u8_buffer: &[u8]) -> Vec<u32> {
     let mut u32_buffer = Vec::with_capacity(u8_buffer.len() / 3);
-    println!("{:?}", u8_buffer.len());
     for chunk in u8_buffer.chunks(3) {
         if chunk.len() == 3 {
             let r = chunk[0] as u32;
@@ -193,57 +216,55 @@ fn u8_to_u32(u8_buffer: &[u8]) -> Vec<u32> {
 }
 
 fn main() {
-    let device = get_3ds_device().unwrap();
-    let handle = get_3ds_handle().unwrap();
-    let endpoint = get_endpoint(device).unwrap();
+    // Need to actually unwrap errors below this.
+    let ds = get_3ds_device_and_handle().expect("unable to locate 3ds device");
+    let endpoint = get_endpoint(ds.device).unwrap();
 
-    let using_kernel_driver = match handle.kernel_driver_active(endpoint.iface) {
+    let using_kernel_driver = match ds.handle.kernel_driver_active(endpoint.iface) {
         Ok(true) => {
-            handle.detach_kernel_driver(endpoint.iface).unwrap();
+            ds.handle.detach_kernel_driver(endpoint.iface).unwrap();
             true
         }
         _ => false,
     };
 
-    handle.set_active_configuration(endpoint.config).unwrap();
-    handle.claim_interface(endpoint.iface).unwrap();
-    handle
+    ds.handle.set_active_configuration(endpoint.config).unwrap();
+    ds.handle.claim_interface(endpoint.iface).unwrap();
+    ds.handle
         .set_alternate_setting(endpoint.iface, endpoint.setting)
         .unwrap();
 
     // This can be made arbitrarily large as long as it's a multiple of 720x240.
-    // Initialize window
     let mut window =
         minifb::Window::new("Test", 1440, 480, minifb::WindowOptions::default()).unwrap();
 
-    // Initialize sound
-    // let host = rodio::cpal::default_host();
-    // let devices = host.output_devices().unwrap();
+    let start_time = SystemTime::now();
+    let mut fps: u64 = 0;
+    let mut last_reported_sec: f32 = 0.0;
 
-    // let mut chosen_dev: Option<rodio::Device> = None;
+    // See https://docs.rs/minifb/latest/i686-pc-windows-msvc/src/minifb/lib.rs.html#533-535
+    window.set_target_fps(60);
 
-    // for device in devices {
-    //     let dev: rodio::Device = device;
-    //     let dev_name: String = dev.name().unwrap();
-    //     println!(" # Device : {}", dev_name);
-    //     chosen_dev = Some(dev);
-    // }
-
-    // let chosen_dev = match chosen_dev {
-    //     None => panic!("no audio device"),
-    //     Some(dev) => dev,
-    // };
-
-    // let (_, audio_handle) = rodio::OutputStream::try_from_device(&chosen_dev).unwrap();
-    // println!("the chosen device is {:?}", chosen_dev.name());
-    // let mut sink = rodio::Sink::try_new(&audio_handle).unwrap();
-
+    // This improved framerates up to about 30fps.
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-        capture_screen(&handle, &endpoint, &mut window);
+        capture_screen(&ds.handle, &endpoint, &mut window);
+
+        // Framerate reporting
+        fps += 1;
+        let current_time = SystemTime::now();
+        let elapsed_secs = current_time
+            .duration_since(start_time)
+            .unwrap()
+            .as_secs_f32();
+        if elapsed_secs - last_reported_sec >= 1.0 {
+            println!("Frames/second: {:?}", fps);
+            last_reported_sec = elapsed_secs;
+            fps = 0;
+        }
     }
 
-    handle.release_interface(endpoint.iface).unwrap();
+    ds.handle.release_interface(endpoint.iface).unwrap();
     if using_kernel_driver {
-        handle.attach_kernel_driver(endpoint.iface).unwrap();
+        ds.handle.attach_kernel_driver(endpoint.iface).unwrap();
     };
 }
