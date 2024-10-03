@@ -2,13 +2,11 @@ const VID_3DS: u16 = 0x16D0;
 const PID_3DS: u16 = 0x06A3;
 use minifb::Scale;
 use minifb::ScaleMode;
+use minifb::Window;
 use minifb::WindowOptions;
-use rodio::OutputStreamHandle;
-use rodio::{OutputStream, Source};
+use rodio::OutputStream;
+use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
-use std::time::SystemTime;
-
-use rusb::{Device, DeviceHandle, GlobalContext};
 // Might be a better way to specify this
 // const BULK_ENDPOINT_ADDRESS: u8 = 130;
 // This might break stuff if we drop below 10 fps
@@ -22,24 +20,130 @@ const VIDEO_HEIGHT: usize = 720;
 const RGB_COLOR_SIZE: usize = 3;
 const VIDEO_BUFFER_SIZE: usize = VIDEO_WIDTH * VIDEO_HEIGHT * RGB_COLOR_SIZE;
 
-// Still figuring out the exact size of the audio buffer.
-const REQUIRED_BUFFER_SIZE: usize = 1916;
-const AUDIO_BUFFER_SIZE: usize = 2188 + REQUIRED_BUFFER_SIZE;
+// const UNKNOWN_BUFFER_SIZE: usize = 1916;
+// const UNKNOWN_BUFFER_SIZE: usize = 2000;
+const UNKNOWN_BUFFER_SIZE: usize = 1920;
+const AUDIO_BUFFER_SIZE: usize = 2188;
+const FULL_AUDIO_BUFFER_SIZE: usize = AUDIO_BUFFER_SIZE + UNKNOWN_BUFFER_SIZE;
 const AUDIO_SAMPLE_HZ: u32 = 32728;
-// const AUDIO_SAMPLE_HZ: u32 = 44100;
-// const AUDIO_SAMPLE_HZ: u32 = 22050;
-
-// Could give more specific explanation here.
-// const FULL_BUFF_SIZE: usize = 522500;
-// Is there a way to make it dynamic?
-// const FULL_BUFF_SIZE: usize = 523500;
-const FULL_BUFF_SIZE: usize = VIDEO_BUFFER_SIZE + AUDIO_BUFFER_SIZE;
+const FULL_BUFF_SIZE: usize = VIDEO_BUFFER_SIZE + FULL_AUDIO_BUFFER_SIZE;
 // This is just an initial value when window can be resized.
 const WINDOW_HEIGHT: usize = 240;
 const WINDOW_WIDTH: usize = 720;
 
-// Could change this if we ultimtely exceed 60 fps
+// Not reaching 60 fps - seems locked at 30.
 const TARGET_FPS: usize = 60;
+struct DS {
+    handle: DeviceHandle<GlobalContext>,
+    endpoint: Endpoint,
+    using_kernel_driver: bool,
+}
+
+impl DS {
+    pub fn new(handle: DeviceHandle<GlobalContext>, endpoint: Endpoint) -> Self {
+        Self {
+            handle,
+            using_kernel_driver: false,
+            endpoint,
+        }
+    }
+
+    pub fn configure(&mut self) -> Result<bool, anyhow::Error> {
+        self.using_kernel_driver = match self.handle.kernel_driver_active(self.endpoint.iface) {
+            Ok(true) => {
+                self.handle
+                    .detach_kernel_driver(self.endpoint.iface)
+                    .unwrap();
+                true
+            }
+            _ => false,
+        };
+
+        self.handle
+            .set_active_configuration(self.endpoint.config)
+            .unwrap();
+        self.handle.claim_interface(self.endpoint.iface).unwrap();
+        self.handle
+            .set_alternate_setting(self.endpoint.iface, self.endpoint.setting)
+            .unwrap();
+
+        Ok(true)
+    }
+
+    pub fn write_control(&self) {
+        let vend_out_buff = [0u8; 512];
+        let vend_out_req_type = rusb::request_type(
+            rusb::Direction::Out,
+            rusb::RequestType::Vendor,
+            rusb::Recipient::Device,
+        );
+
+        self.handle
+            .write_control(
+                vend_out_req_type,
+                VEND_OUT_REQ,
+                VEND_OUT_VALUE,
+                VEND_OUT_IDX,
+                &vend_out_buff,
+                DEFAULT_TIMEOUT,
+            )
+            .expect("unable to vend out to device");
+    }
+
+    // These don't necessarily need the reference ot self. These could be
+    // on a window object on the 3DS.
+    pub fn serve_video(&self, window: &mut Window, video: [u8; VIDEO_BUFFER_SIZE]) {
+        let vid_buf_32 = u8_to_u32(&video);
+        let rotated_vid_buf = rotate_270(&vid_buf_32, WINDOW_HEIGHT, WINDOW_WIDTH);
+        window
+            .update_with_buffer(&rotated_vid_buf, WINDOW_WIDTH, WINDOW_HEIGHT)
+            .unwrap();
+    }
+
+    pub fn serve_audio(&self, sink: &rodio::Sink, audio: [u8; FULL_AUDIO_BUFFER_SIZE]) {
+        let i16_sample: Vec<i16> = audio
+            .chunks(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, i16_sample.clone());
+
+        sink.append(audio_src);
+    }
+
+    pub fn get_buffers(&self) -> ([u8; VIDEO_BUFFER_SIZE], [u8; FULL_AUDIO_BUFFER_SIZE]) {
+        let mut buff = vec![0u8; FULL_BUFF_SIZE];
+
+        loop {
+            match self
+                .handle
+                .read_bulk(self.endpoint.address, &mut buff, DEFAULT_TIMEOUT)
+            {
+                Ok(bytes_rec) => {
+                    if bytes_rec == 0 {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("unable to read from bulk endpoint: {}", err);
+                    break;
+                }
+            }
+        }
+
+        let (vid_buff, remainder) = buff
+            .split_first_chunk::<VIDEO_BUFFER_SIZE>()
+            .expect("couldnt extract buffers");
+
+        // There may be chunks left over.
+        let (audio_buff, _) = remainder
+            .split_first_chunk::<FULL_AUDIO_BUFFER_SIZE>()
+            .expect("couldnt extract audio buffer");
+
+        // Not sure if this is efficient - might want pointer.
+        (*vid_buff, *audio_buff)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -57,17 +161,6 @@ impl Endpoint {
             setting,
             address,
         }
-    }
-}
-
-struct DS {
-    device: Device<GlobalContext>,
-    handle: DeviceHandle<GlobalContext>,
-}
-
-impl DS {
-    pub fn new(device: Device<GlobalContext>, handle: DeviceHandle<GlobalContext>) -> Self {
-        Self { device, handle }
     }
 }
 
@@ -97,13 +190,11 @@ impl CustomWindowOptions {
     }
 }
 
-fn get_3ds_device_and_handle() -> Result<DS, anyhow::Error> {
-    // Not sure why I still need unwraps here.
+fn get_3ds_device() -> Result<DS, anyhow::Error> {
     let device = rusb::devices()
         .unwrap()
         .iter()
         .find(|dvc| {
-            // Remove unwrpaps
             let desc = dvc.device_descriptor().unwrap();
             desc.vendor_id() == VID_3DS && desc.product_id() == PID_3DS
         })
@@ -114,14 +205,6 @@ fn get_3ds_device_and_handle() -> Result<DS, anyhow::Error> {
         .ok_or(anyhow::Error::msg("unable to retrieve device handle"))
         .unwrap();
 
-    Ok(DS::new(device, handle))
-}
-
-fn get_endpoint(device: rusb::Device<rusb::GlobalContext>) -> Result<Endpoint, anyhow::Error> {
-    let device_desc = device.device_descriptor().unwrap();
-    println!("Max supported USB Version: {}", device_desc.usb_version());
-
-    // AFAIK there is only one bulk endpoint, but could be improved to check.
     let config_desc = match device.config_descriptor(0) {
         Ok(cd) => cd,
         Err(e) => {
@@ -131,12 +214,10 @@ fn get_endpoint(device: rusb::Device<rusb::GlobalContext>) -> Result<Endpoint, a
             )))
         }
     };
-
     let interface = match config_desc.interfaces().last() {
         Some(iface) => iface,
         None => return Err(anyhow::Error::msg("unable to retrieve interface")),
     };
-
     let interface_desc = match interface.descriptors().last() {
         Some(id) => id,
         None => {
@@ -145,7 +226,6 @@ fn get_endpoint(device: rusb::Device<rusb::GlobalContext>) -> Result<Endpoint, a
             ))
         }
     };
-
     let endpoint_desc = match interface_desc.endpoint_descriptors().last() {
         Some(ed) => ed,
         None => {
@@ -155,94 +235,16 @@ fn get_endpoint(device: rusb::Device<rusb::GlobalContext>) -> Result<Endpoint, a
         }
     };
 
-    Ok(Endpoint::new(
+    let endpoint = Endpoint::new(
         config_desc.number(),
         interface_desc.interface_number(),
         interface_desc.setting_number(),
         endpoint_desc.address(),
-    ))
-}
-
-// Might just be my screen but could be worth brightening this too.
-// this wont really be capture screen anymore
-fn capture_screen(
-    handle: &DeviceHandle<GlobalContext>,
-    endpoint: &Endpoint,
-    window: &mut minifb::Window,
-    audio_handle: &OutputStreamHandle,
-) {
-    // Should be able to clean this up so we don't need to duplicate the buffer.
-    // let max_buffer_size = 525000;
-
-    let vend_out_buff = [0u8; 512];
-    let vend_out_req_type = rusb::request_type(
-        rusb::Direction::Out,
-        rusb::RequestType::Vendor,
-        rusb::Recipient::Device,
     );
 
-    // Probably need to handle this because it could fail on any vend
-    // I guess we need to do this each time?
-    handle
-        .write_control(
-            vend_out_req_type,
-            VEND_OUT_REQ,
-            VEND_OUT_VALUE,
-            VEND_OUT_IDX,
-            &vend_out_buff,
-            DEFAULT_TIMEOUT,
-        )
-        .expect("unable to vend out to device");
-
-    let mut combined_buff = vec![0u8; FULL_BUFF_SIZE];
-
-    // Explore options to reduce input lag?
-    loop {
-        match handle.read_bulk(endpoint.address, &mut combined_buff, DEFAULT_TIMEOUT) {
-            Ok(bytes_rec) => {
-                if bytes_rec == 0 {
-                    break;
-                }
-            }
-            Err(err) => {
-                eprintln!("unable to read from bulk endpoint: {}", err);
-                break;
-            }
-        }
-    }
-
-    // This needs to be moved up a level.
-    let (vid_buff, remainder) = combined_buff
-        .split_first_chunk::<VIDEO_BUFFER_SIZE>()
-        .expect("couldnt break buffers");
-
-    let (audio_buff, info_buff) = remainder
-        .split_first_chunk::<AUDIO_BUFFER_SIZE>()
-        .expect("couldnt break audio buffer");
-
-    let width = 240;
-    let height = 720;
-
-    // Should make this a constant
-    let f32_sample: Vec<f32> = audio_buff
-        .iter()
-        .map(|&sample| (sample as f32 - 128.0) / 128.0)
-        .collect();
-    // Wonder if there's a way we can avoid the rotation. Or continue building the buffer without blocking the draw.
-
-    let vid_buf_32 = u8_to_u32(vid_buff);
-    let rotated_vid_buf = rotate_270(&vid_buf_32, width, height);
-    window
-        .update_with_buffer(&rotated_vid_buf, height, width)
-        .unwrap();
-
-    let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, f32_sample);
-    audio_handle
-        .play_raw(audio_src.convert_samples())
-        .expect("couldnt play audio");
+    Ok(DS::new(handle, endpoint))
 }
 
-// ROTATING CODE
 fn rotate_270(buffer: &[u32], width: usize, height: usize) -> Vec<u32> {
     let mut rotated_buffer = vec![0; width * height];
 
@@ -283,65 +285,37 @@ fn u8_to_u32(u8_buffer: &[u8]) -> Vec<u32> {
 }
 
 fn main() {
-    // Need to actually unwrap errors below this.
-    let ds = get_3ds_device_and_handle().expect("unable to locate 3ds device");
-    let endpoint = get_endpoint(ds.device).unwrap();
+    let mut ds = get_3ds_device().expect("unable to locate 3ds device");
+    ds.configure().expect("could not configure 3ds");
 
-    let using_kernel_driver = match ds.handle.kernel_driver_active(endpoint.iface) {
-        Ok(true) => {
-            ds.handle.detach_kernel_driver(endpoint.iface).unwrap();
-            true
-        }
-        _ => false,
-    };
-
-    ds.handle.set_active_configuration(endpoint.config).unwrap();
-    ds.handle.claim_interface(endpoint.iface).unwrap();
-    ds.handle
-        .set_alternate_setting(endpoint.iface, endpoint.setting)
-        .unwrap();
-
+    // Video
     let window_options =
         CustomWindowOptions::new(true, true, Scale::X2, ScaleMode::AspectRatioStretch);
+    let mut window = minifb::Window::new(
+        "Krab3DS",
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+        window_options.inner(),
+    )
+    .unwrap();
+    window.set_target_fps(TARGET_FPS);
 
-    let mut window =
-        minifb::Window::new("Test", WINDOW_WIDTH, WINDOW_HEIGHT, window_options.inner()).unwrap();
-
-    let start_time = SystemTime::now();
-    let mut fps: u64 = 0;
-    let mut last_reported_sec: f32 = 0.0;
-
+    // Audio
     let (_audio_stream, audio_stream_handle) =
         OutputStream::try_default().expect("couldnt create output stream");
+    let sink = rodio::Sink::try_new(&audio_stream_handle).unwrap();
 
-    // Way to improve this might be as follows:
-    // Loop through data from device as quickly as possible and return video, audio.
-    // Queue video and audio into buffers.
-    // Have separate method that sends out smooth synced video/audio.
-    // TLDR Audio/video syncing is hard.
-
-    // See https://docs.rs/minifb/latest/i686-pc-windows-msvc/src/minifb/lib.rs.html#533-535
-    window.set_target_fps(TARGET_FPS);
-    // This improved framerates up to the cap of 30fps on most games
-    // Would be nice to find something with 60fps to test.
+    // Run
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-        capture_screen(&ds.handle, &endpoint, &mut window, &audio_stream_handle);
-
-        fps += 1;
-        let current_time = SystemTime::now();
-        let elapsed_secs = current_time
-            .duration_since(start_time)
-            .unwrap()
-            .as_secs_f32();
-        if elapsed_secs - last_reported_sec >= 1.0 {
-            println!("Frames/second: {:?}", fps);
-            last_reported_sec = elapsed_secs;
-            fps = 0;
-        }
+        ds.write_control();
+        let (video, audio) = ds.get_buffers();
+        ds.serve_audio(&sink, audio);
+        ds.serve_video(&mut window, video)
     }
 
-    ds.handle.release_interface(endpoint.iface).unwrap();
-    if using_kernel_driver {
-        ds.handle.attach_kernel_driver(endpoint.iface).unwrap();
+    // Release interface
+    ds.handle.release_interface(ds.endpoint.iface).unwrap();
+    if ds.using_kernel_driver {
+        ds.handle.attach_kernel_driver(ds.endpoint.iface).unwrap();
     };
 }
