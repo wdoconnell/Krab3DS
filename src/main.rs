@@ -1,5 +1,4 @@
-const VID_3DS: u16 = 0x16D0;
-const PID_3DS: u16 = 0x06A3;
+use hound::Sample;
 use minifb::Scale;
 use minifb::ScaleMode;
 use minifb::Window;
@@ -7,9 +6,12 @@ use minifb::WindowOptions;
 use rodio::OutputStream;
 use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
-// Might be a better way to specify this
+
 // const BULK_ENDPOINT_ADDRESS: u8 = 130;
-// This might break stuff if we drop below 10 fps
+const VID_3DS: u16 = 0x16D0;
+const PID_3DS: u16 = 0x06A3;
+
+// Will this break if we drop below 10fps?
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 const VEND_OUT_REQ: u8 = 0x40;
 const VEND_OUT_VALUE: u16 = 0;
@@ -131,7 +133,12 @@ impl DS {
             })
             .collect();
 
-        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, i16_sample);
+        let last_valid_idx = i16_sample
+            .iter()
+            .rposition(|byte| byte.as_i16() != 0)
+            .unwrap();
+        let sanitized_audio: Vec<i16> = i16_sample.iter().take(last_valid_idx).copied().collect();
+        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, sanitized_audio);
 
         sink.append(audio_src);
     }
