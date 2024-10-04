@@ -122,10 +122,16 @@ impl DS {
     pub fn serve_audio(&self, sink: &rodio::Sink, audio: [u8; FULL_AUDIO_BUFFER_SIZE]) {
         let i16_sample: Vec<i16> = audio
             .chunks(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .map(|chunk| {
+                if chunk.len() == 2 {
+                    (chunk[1] as i16) << 8 | (chunk[0] as i16)
+                } else {
+                    chunk[0] as i16
+                }
+            })
             .collect();
 
-        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, i16_sample.clone());
+        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, i16_sample);
 
         sink.append(audio_src);
     }
