@@ -1,9 +1,11 @@
+use core::time;
 use hound::Sample;
 use minifb::Scale;
 use minifb::ScaleMode;
 use minifb::Window;
 use minifb::WindowOptions;
 use rodio::OutputStream;
+use rodio::Source;
 use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
 
@@ -24,11 +26,17 @@ const VIDEO_BUFFER_SIZE: usize = VIDEO_WIDTH * VIDEO_HEIGHT * RGB_COLOR_SIZE;
 
 // const UNKNOWN_BUFFER_SIZE: usize = 1916;
 // const UNKNOWN_BUFFER_SIZE: usize = 2000;
-const UNKNOWN_BUFFER_SIZE: usize = 1920;
-const AUDIO_BUFFER_SIZE: usize = 2188;
-const FULL_AUDIO_BUFFER_SIZE: usize = AUDIO_BUFFER_SIZE + UNKNOWN_BUFFER_SIZE;
+// I think this is the solution. Just need to get the right number here.
+
+// 1028 (2 ^ 10) * 4 - 2 (2^ 12).
+const GAP_MULTIPLIER: f32 = 0.97;
+const AUDIO_BUFFER_SIZE: usize = 4112;
 const AUDIO_SAMPLE_HZ: u32 = 32728;
-const FULL_BUFF_SIZE: usize = VIDEO_BUFFER_SIZE + FULL_AUDIO_BUFFER_SIZE;
+// const AUDIO_TRUNCATED_BYTES: usize = 6;
+const AUDIO_TRUNCATED_BYTES: usize = 4;
+// const AUDIO_SAMPLE_HZ: u32 = (32728.0 * GAP_MULTIPLIER) as u32;
+
+const FULL_BUFF_SIZE: usize = VIDEO_BUFFER_SIZE + AUDIO_BUFFER_SIZE;
 // This is just an initial value when window can be resized.
 const WINDOW_HEIGHT: usize = 240;
 const WINDOW_WIDTH: usize = 720;
@@ -121,29 +129,27 @@ impl DS {
     }
 
     // Should try moving this to a separate audio device
-    pub fn serve_audio(&self, sink: &rodio::Sink, audio: [u8; FULL_AUDIO_BUFFER_SIZE]) {
-        let i16_sample: Vec<i16> = audio
+    pub fn serve_audio(&self, sink: &rodio::Sink, audio: [u8; AUDIO_BUFFER_SIZE]) {
+        let mut i16_sample: Vec<i16> = audio
             .chunks(2)
-            .map(|chunk| {
-                if chunk.len() == 2 {
-                    (chunk[1] as i16) << 8 | (chunk[0] as i16)
-                } else {
-                    chunk[0] as i16
-                }
-            })
+            .map(|chunk| (chunk[1] as i16) << 8 | (chunk[0] as i16))
             .collect();
 
-        let last_valid_idx = i16_sample
-            .iter()
-            .rposition(|byte| byte.as_i16() != 0)
-            .unwrap();
-        let sanitized_audio: Vec<i16> = i16_sample.iter().take(last_valid_idx).copied().collect();
-        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, sanitized_audio);
+        // The last 4 bytes in the buffer EXCEPT IN RARE CASES don't contain any data.
+        // So we must size the array to include it, but can truncate.
+        let (remaining_sample, truncated) =
+            i16_sample.split_at(AUDIO_BUFFER_SIZE / 2 - AUDIO_TRUNCATED_BYTES);
+
+        // Set speed appropriately - might not ultimately be necessary.
+        let audio_src = rodio::buffer::SamplesBuffer::new(2, AUDIO_SAMPLE_HZ, remaining_sample)
+            .speed(GAP_MULTIPLIER);
+        // println!("playing: {:?}", remaining_sample);
+        // println!("truncated: {:?}", truncated);
 
         sink.append(audio_src);
     }
 
-    pub fn get_buffers(&self) -> ([u8; VIDEO_BUFFER_SIZE], [u8; FULL_AUDIO_BUFFER_SIZE]) {
+    pub fn get_buffers(&self) -> ([u8; VIDEO_BUFFER_SIZE], [u8; AUDIO_BUFFER_SIZE]) {
         let mut buff = vec![0u8; FULL_BUFF_SIZE];
 
         loop {
@@ -163,17 +169,17 @@ impl DS {
             }
         }
 
-        let (vid_buff, remainder) = buff
-            .split_first_chunk::<VIDEO_BUFFER_SIZE>()
-            .expect("couldnt extract buffers");
+        let (vid_slice, audio_slice) = buff.split_at(VIDEO_BUFFER_SIZE);
+        let mut vid_arr = [0u8; VIDEO_BUFFER_SIZE];
+        vid_arr.copy_from_slice(vid_slice);
 
-        // There may be chunks left over.
-        let (audio_buff, _) = remainder
-            .split_first_chunk::<FULL_AUDIO_BUFFER_SIZE>()
-            .expect("couldnt extract audio buffer");
+        let mut audio_arr = [0u8; AUDIO_BUFFER_SIZE];
+        audio_arr.copy_from_slice(audio_slice);
 
-        // Not sure if this is efficient - might want pointer.
-        (*vid_buff, *audio_buff)
+        // let last_nonzero = audio_buff.iter().rposition(|&x| x != 0).unwrap();
+        // let total_zeroes = audio_buff.len() - last_nonzero;
+        // println!("{:?}", total_zeroes);
+        (vid_arr, audio_arr)
     }
 }
 
@@ -321,7 +327,7 @@ fn main() {
     ds.configure().expect("could not configure 3ds");
 
     // Audio
-    let (_audio_stream, audio_stream_handle) =
+    let (audio_stream, audio_stream_handle) =
         OutputStream::try_default().expect("couldnt create output stream");
     let sink = rodio::Sink::try_new(&audio_stream_handle).unwrap();
 
