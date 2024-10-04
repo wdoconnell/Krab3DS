@@ -37,14 +37,42 @@ struct DS {
     handle: DeviceHandle<GlobalContext>,
     endpoint: Endpoint,
     using_kernel_driver: bool,
+    display: Display,
+}
+
+struct Display {
+    window: Window,
+}
+
+impl Display {
+    pub fn new(window: Window) -> Self {
+        Self { window }
+    }
+
+    pub fn serve_video(&mut self, video: [u8; VIDEO_BUFFER_SIZE]) {
+        let vid_buf_32 = u8_to_u32(&video);
+        let rotated_vid_buf = rotate_270(&vid_buf_32, WINDOW_HEIGHT, WINDOW_WIDTH);
+        self.window
+            .update_with_buffer(&rotated_vid_buf, WINDOW_WIDTH, WINDOW_HEIGHT)
+            .unwrap();
+    }
 }
 
 impl DS {
     pub fn new(handle: DeviceHandle<GlobalContext>, endpoint: Endpoint) -> Self {
+        let opts = CustomWindowOptions::new(true, true, Scale::X2, ScaleMode::AspectRatioStretch);
+
+        let mut window =
+            minifb::Window::new("Krab3DS", WINDOW_WIDTH, WINDOW_HEIGHT, opts.inner()).unwrap();
+        window.set_target_fps(TARGET_FPS);
+
+        let display = Display::new(window);
+
         Self {
             handle,
             using_kernel_driver: false,
             endpoint,
+            display,
         }
     }
 
@@ -90,16 +118,7 @@ impl DS {
             .expect("unable to vend out to device");
     }
 
-    // These don't necessarily need the reference ot self. These could be
-    // on a window object on the 3DS.
-    pub fn serve_video(&self, window: &mut Window, video: [u8; VIDEO_BUFFER_SIZE]) {
-        let vid_buf_32 = u8_to_u32(&video);
-        let rotated_vid_buf = rotate_270(&vid_buf_32, WINDOW_HEIGHT, WINDOW_WIDTH);
-        window
-            .update_with_buffer(&rotated_vid_buf, WINDOW_WIDTH, WINDOW_HEIGHT)
-            .unwrap();
-    }
-
+    // Should try moving this to a separate audio device
     pub fn serve_audio(&self, sink: &rodio::Sink, audio: [u8; FULL_AUDIO_BUFFER_SIZE]) {
         let i16_sample: Vec<i16> = audio
             .chunks(2)
@@ -288,29 +307,17 @@ fn main() {
     let mut ds = get_3ds_device().expect("unable to locate 3ds device");
     ds.configure().expect("could not configure 3ds");
 
-    // Video
-    let window_options =
-        CustomWindowOptions::new(true, true, Scale::X2, ScaleMode::AspectRatioStretch);
-    let mut window = minifb::Window::new(
-        "Krab3DS",
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT,
-        window_options.inner(),
-    )
-    .unwrap();
-    window.set_target_fps(TARGET_FPS);
-
     // Audio
     let (_audio_stream, audio_stream_handle) =
         OutputStream::try_default().expect("couldnt create output stream");
     let sink = rodio::Sink::try_new(&audio_stream_handle).unwrap();
 
     // Run
-    while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+    while ds.display.window.is_open() && !ds.display.window.is_key_down(minifb::Key::Escape) {
         ds.write_control();
         let (video, audio) = ds.get_buffers();
         ds.serve_audio(&sink, audio);
-        ds.serve_video(&mut window, video)
+        ds.display.serve_video(video)
     }
 
     // Release interface
